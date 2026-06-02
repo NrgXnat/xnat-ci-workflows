@@ -1,0 +1,281 @@
+name: Reusable - Gradle Build and Publish
+
+# Reusable workflow that builds a gradle project, optionally publishes to
+# JFrog (nrgxnat.jfrog.io) and/or builds a Docker image and pushes to GHCR
+# (ghcr.io/<owner>/<image-name>:<version>).
+#
+# Caller side is ~20 lines (one `jobs.<x>.uses:` block plus `with:` and
+# `secrets: inherit`). See README for the full caller template.
+
+on:
+  workflow_call:
+    inputs:
+      # ──────────── Build environment ────────────
+      runner:
+        type: string
+        default: 'ubuntu-latest'
+        description: 'GitHub-hosted runner label'
+      java-version:
+        type: string
+        default: '21'
+        description: 'JDK major version (e.g. 8 / 21)'
+      java-distribution:
+        type: string
+        default: 'temurin'
+
+      # ──────────── Gradle ────────────
+      gradle-build-task:
+        type: string
+        default: 'build'
+        description: 'Gradle task list, e.g. "build" or "clean assemble"'
+      gradle-build-args:
+        type: string
+        default: ''
+        description: 'Extra gradle args, e.g. "-x test"'
+
+      # ──────────── Artifact ────────────
+      artifact-glob:
+        type: string
+        required: true
+        description: 'Where the produced jar/war lives, e.g. "xnat-web/build/libs/*.war" or "build/libs/*.jar"'
+      artifact-name:
+        type: string
+        default: 'build-artifact'
+        description: 'Workflow artifact name (cross-job transfer)'
+
+      # ──────────── JFrog ────────────
+      publish-jfrog:
+        type: boolean
+        default: true
+
+      # ──────────── Docker / GHCR ────────────
+      publish-ghcr:
+        type: boolean
+        default: false
+        description: 'If true, build a Docker image from ${dockerfile-path} and push to ghcr.io/<owner>/<image-name>:<version>'
+      image-name:
+        type: string
+        default: ''
+        description: 'GHCR image name segment, e.g. "xnat-web". Required when publish-ghcr=true'
+      dockerfile-path:
+        type: string
+        default: './Dockerfile'
+      docker-build-args:
+        type: string
+        default: ''
+        description: 'Multiline docker build args, e.g. "TOMCAT_BASE=tomcat:9.0.93-jdk8"'
+      docker-context-filename:
+        type: string
+        default: ''
+        description: 'If set, rename the downloaded artifact to this filename inside ./docker-context/ before docker build. e.g. "xnat.war"'
+      logback-path-in-war:
+        type: string
+        default: ''
+        description: 'Path to logback.xml inside the war. Empty = no rewrite. e.g. "WEB-INF/classes/logback.xml"'
+
+    secrets:
+      XNAT_ARTIFACTORY_USER:
+        required: false
+      XNAT_ARTIFACTORY_TOKEN:
+        required: false
+
+jobs:
+  # ─────────────────────────── 1. Build ───────────────────────────────
+  build:
+    name: Build
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      version: ${{ steps.gradle-props.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ inputs.java-distribution }}
+          java-version: ${{ inputs.java-version }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-home-cache-includes: |
+            caches
+            notifications
+            jdks
+
+      - name: Read project version
+        id: gradle-props
+        run: |
+          VERSION=$(grep '^version=' gradle.properties | cut -d= -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Stage 1 — Gradle build
+        run: ./gradlew ${{ inputs.gradle-build-task }} ${{ inputs.gradle-build-args }}
+
+      # Stage 2: publish to JFrog. Reuses Stage 1's incremental outputs so
+      # this step typically just runs generatePomFile + HTTP upload.
+      # Modules with versions already present in the release repo get
+      # SKIPPED by the caller project's buildSrc onlyIf (see e.g.
+      # NrgXnat/xnat's buildlogic.java-common-conventions.gradle).
+      - name: Stage 2 — Publish to JFrog Artifactory
+        if: inputs.publish-jfrog
+        env:
+          ORG_GRADLE_PROJECT_artifactoryUser:  ${{ secrets.XNAT_ARTIFACTORY_USER }}
+          ORG_GRADLE_PROJECT_artifactoryToken: ${{ secrets.XNAT_ARTIFACTORY_TOKEN }}
+        run: ./gradlew publish -x test
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.artifact-glob }}
+          retention-days: 7
+          if-no-files-found: error
+
+  # ─────────────────── 2. Build & Push Docker Image (GHCR) ────────────
+  publish-ghcr:
+    name: Build & Push Docker Image (GHCR)
+    needs: build
+    if: inputs.publish-ghcr
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout (for Dockerfile + docker/ helper scripts)
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ./docker-context
+
+      - name: Normalise artifact filename (optional)
+        if: inputs.docker-context-filename != ''
+        run: |
+          set -euo pipefail
+          # Rename downloaded artifact to the caller-specified filename.
+          # Only one file expected in the artifact-glob output for this to
+          # work cleanly.
+          shopt -s nullglob
+          FILES=(./docker-context/*)
+          if [ ${#FILES[@]} -ne 1 ]; then
+            echo "Expected exactly 1 artifact file, found ${#FILES[@]}:"
+            ls -lh ./docker-context
+            exit 1
+          fi
+          mv "${FILES[0]}" "./docker-context/${{ inputs.docker-context-filename }}"
+          ls -lh ./docker-context
+
+      # XNAT WARs default to RollingFileAppender logback, which writes to
+      # files inside the container instead of stdout — so `docker logs`
+      # shows nothing. When `logback-path-in-war` is supplied, this step
+      # rewrites every <appender> to ConsoleAppender and prefixes the
+      # encoder pattern with [<appenderName>] so streams are distinguishable.
+      # Mirrors what the old Jenkins docker-build.sh did with edit-log.py.
+      - name: Rewrite logback.xml inside WAR (ConsoleAppender for container logs)
+        if: inputs.logback-path-in-war != ''
+        working-directory: ./docker-context
+        env:
+          WAR_FILE: ${{ inputs.docker-context-filename }}
+          LOGBACK: ${{ inputs.logback-path-in-war }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WAR_FILE" ]; then
+            # If no rename happened, find the single .war file in the dir.
+            shopt -s nullglob
+            WARS=(*.war)
+            if [ ${#WARS[@]} -ne 1 ]; then
+              echo "Expected exactly 1 .war in docker-context, found ${#WARS[@]}"; exit 1
+            fi
+            WAR_FILE="${WARS[0]}"
+          fi
+          echo "=== logback.xml BEFORE ==="
+          unzip -p "$WAR_FILE" "$LOGBACK" | head -40
+
+          jar xf "$WAR_FILE" "$LOGBACK"
+
+          # edit-log.py inlined here so this reusable workflow doesn't
+          # require a cross-repo checkout (GITHUB_TOKEN can't read other
+          # private repos by default). Logic ported verbatim from
+          # build_scripts_v2/edit-log.py.
+          cat > /tmp/edit-log.py <<'PYEOF'
+          import argparse
+          import xml.etree.ElementTree as ET
+
+          def edit(logfile):
+              tree = ET.parse(logfile)
+              root = tree.getroot()
+              for appender in root.findall('appender'):
+                  name=appender.get('name')
+                  appender.set('class', 'ch.qos.logback.core.ConsoleAppender')
+                  removeItems =[]
+                  for item in appender:
+                      if item.tag.lower() != "encoder":
+                          removeItems.append(item)
+                      else:
+                          pattern=item.find('pattern')
+                          if not pattern is None:
+                              value=pattern.text
+                              pattern.text = value.replace("%d ", "%d ["+name+"] ")
+
+                  for elem in removeItems:
+                      appender.remove(elem)
+
+              tree.write(logfile,'UTF-8',True)
+
+          parser = argparse.ArgumentParser(description="Modify logback.xml file")
+          group = parser.add_argument_group('Required')
+          group.add_argument('--logfile', action="store", dest='logfile', required=True, help='log file')
+          args = parser.parse_args()
+
+          edit(args.logfile)
+          PYEOF
+
+          python3 /tmp/edit-log.py --logfile "$LOGBACK"
+          jar uf "$WAR_FILE" "$LOGBACK"
+          echo "=== logback.xml AFTER ==="
+          cat "$LOGBACK"
+          rm -rf WEB-INF META-INF
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Single tag matches the old Jenkins style:
+      #   docker push xnatworks/$image:$version
+      # GHCR enforces lowercase owner segment, so we tr-lowercase.
+      - name: Compute image tag
+        id: tags
+        env:
+          OWNER:   ${{ github.repository_owner }}
+          VERSION: ${{ needs.build.outputs.version }}
+          IMAGE:   ${{ inputs.image-name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$IMAGE" ]; then
+            echo "image-name input is required when publish-ghcr=true"; exit 1
+          fi
+          OWNER_LC=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
+          TAG="ghcr.io/${OWNER_LC}/${IMAGE}:${VERSION}"
+          echo "tags=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${TAG}"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile-path }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: ${{ inputs.docker-build-args }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
