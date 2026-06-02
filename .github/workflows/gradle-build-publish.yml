@@ -104,10 +104,31 @@ jobs:
             notifications
             jdks
 
+      # Reads the gradle project version. Tries gradle.properties first
+      # (preferred — works with `version=X.Y.Z` style); falls back to
+      # parsing build.gradle's `version "X.Y.Z"` or `version = "X.Y.Z"`
+      # for plugin projects that don't use gradle.properties.
       - name: Read project version
         id: gradle-props
         run: |
-          VERSION=$(grep '^version=' gradle.properties | cut -d= -f2)
+          set -euo pipefail
+          VERSION=""
+          if [ -f gradle.properties ]; then
+            VERSION=$(grep -E '^version[[:space:]]*=' gradle.properties | head -1 | cut -d= -f2 | tr -d '[:space:]' || true)
+          fi
+          if [ -z "$VERSION" ] && [ -f build.gradle ]; then
+            # Match: version "x.y.z"  or  version = "x.y.z"  (Groovy DSL)
+            VERSION=$(grep -E '^version[[:space:]]*=?[[:space:]]*"' build.gradle | head -1 | sed -E 's/^version[[:space:]]*=?[[:space:]]*"([^"]+)".*/\1/')
+          fi
+          if [ -z "$VERSION" ] && [ -f build.gradle.kts ]; then
+            # Match: version = "x.y.z"  (Kotlin DSL)
+            VERSION=$(grep -E '^version[[:space:]]*=[[:space:]]*"' build.gradle.kts | head -1 | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "Could not determine project version from gradle.properties or build.gradle(.kts)"
+            exit 1
+          fi
+          echo "Resolved project version: $VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Stage 1 — Gradle build
