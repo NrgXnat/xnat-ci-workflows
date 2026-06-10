@@ -24,7 +24,7 @@ name: Build and Publish
 
 on:
   push:
-    branches: [master, develop, 'releases/*', github-build]
+    branches: [main, develop, 'releases/*']
   workflow_dispatch:
     inputs:
       publish_jfrog: { type: boolean, default: false }
