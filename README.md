@@ -51,7 +51,7 @@ name: Build and Publish
 
 on:
   push:
-    branches: [master, dev, 'releases/*']     # plugin uses `dev` not `develop`
+    branches: [master, main, dev, develop, 'releases/*']     # different plugins use `dev` or `develop`
   workflow_dispatch:
     inputs:
       publish_jfrog: { type: boolean, default: true }
