@@ -104,12 +104,15 @@ jobs:
             notifications
             jdks
 
-      # Reads the gradle project version. Tries gradle.properties first
-      # (preferred — works with `version=X.Y.Z` style); falls back to
-      # parsing build.gradle's `version "X.Y.Z"` or `version = "X.Y.Z"`
-      # for plugin projects that don't use gradle.properties.
+      # Reads the gradle project version, used to tag the GHCR image — the only
+      # thing that consumes it — so the whole step is skipped when publish-ghcr
+      # is false. Tries gradle.properties first (preferred — works with
+      # `version=X.Y.Z` style), then a quoted literal in build.gradle(.kts), then
+      # asks gradle itself, which resolves declarations no grep can see (e.g.
+      # `version buildVersion`, or a version computed in the build script).
       - name: Read project version
         id: gradle-props
+        if: inputs.publish-ghcr
         run: |
           set -euo pipefail
           VERSION=""
@@ -117,15 +120,21 @@ jobs:
             VERSION=$(grep -E '^version[[:space:]]*=' gradle.properties | head -1 | cut -d= -f2 | tr -d '[:space:]' || true)
           fi
           if [ -z "$VERSION" ] && [ -f build.gradle ]; then
-            # Match: version "x.y.z"  or  version = "x.y.z"  (Groovy DSL)
-            VERSION=$(grep -E '^version[[:space:]]*=?[[:space:]]*"' build.gradle | head -1 | sed -E 's/^version[[:space:]]*=?[[:space:]]*"([^"]+)".*/\1/')
+            # Match: version "x.y.z" / version 'x.y.z' / version = "x.y.z"  (Groovy DSL)
+            VERSION=$(grep -E "^version[[:space:]]*=?[[:space:]]*[\"']" build.gradle | head -1 | sed -E "s/^version[[:space:]]*=?[[:space:]]*[\"']([^\"']+)[\"'].*/\1/" || true)
           fi
           if [ -z "$VERSION" ] && [ -f build.gradle.kts ]; then
             # Match: version = "x.y.z"  (Kotlin DSL)
-            VERSION=$(grep -E '^version[[:space:]]*=[[:space:]]*"' build.gradle.kts | head -1 | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+            VERSION=$(grep -E '^version[[:space:]]*=[[:space:]]*"' build.gradle.kts | head -1 | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/' || true)
           fi
           if [ -z "$VERSION" ]; then
-            echo "Could not determine project version from gradle.properties or build.gradle(.kts)"
+            # Last resort: ask gradle. Costs one configuration-phase invocation,
+            # but only on projects the greps above can't read.
+            echo "No version literal found; falling back to './gradlew properties'"
+            VERSION=$(./gradlew properties -q --console=plain 2>/dev/null | grep -E '^version:' | head -1 | sed -E 's/^version:[[:space:]]*//' || true)
+          fi
+          if [ -z "$VERSION" ] || [ "$VERSION" = "unspecified" ]; then
+            echo "Could not determine project version from gradle.properties, build.gradle(.kts), or gradle itself"
             exit 1
           fi
           echo "Resolved project version: $VERSION"
