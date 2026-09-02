@@ -308,10 +308,6 @@ jobs:
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           build-args: ${{ inputs.docker-build-args }}
-          # Empty builds for the runner architecture alone, which is the default behaviour. When
-          # set, BuildKit populates TARGETOS/TARGETARCH per platform, so a Dockerfile that declares
-          # ARG TARGETARCH can fetch the right architecture's binaries -- note that declaring a
-          # default for that ARG masks the value and silently produces a wrong-architecture image.
           platforms: ${{ inputs.docker-platforms }}
           cache-from: type=gha
           cache-to:   type=gha,mode=max
