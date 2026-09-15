@@ -47,13 +47,26 @@ jobs:
   cut-rc:
     runs-on: ubuntu-latest
 
+    # Surfaced as env so the guard below uses the always-available env context
+    # rather than relying on secrets being readable from a step-level if.
+    env:
+      RELEASE_APP_ID: ${{ secrets.XNAT_RELEASE_APP_ID }}
+
     steps:
+      - name: Generate token from GitHub App
+        id: app_token
+        if: env.RELEASE_APP_ID != ''
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.XNAT_RELEASE_APP_ID }}
+          private-key: ${{ secrets.XNAT_RELEASE_APP_PRIVATE_KEY }}
+
       - name: Checkout ${{ inputs.source_branch }}
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_branch }}
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app_token.outputs.token || secrets.GITHUB_TOKEN }}
 
       - name: Read current state and derive versions
         id: vars
@@ -147,9 +160,12 @@ jobs:
           git push origin "${SOURCE_BRANCH}"
 
       - name: Trigger build/publish on RC branch and source_branch
-        if: ${{ inputs.trigger_build }}
+        # Only needed when pushing as GITHUB_TOKEN, whose pushes GitHub suppresses
+        # to prevent recursion. App-token pushes DO trigger build-publish on their
+        # own, so dispatching as well would publish the same version twice.
+        if: ${{ inputs.trigger_build && steps.app_token.outputs.token == '' }}
         env:
-          GH_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN:      ${{ steps.app_token.outputs.token || secrets.GITHUB_TOKEN }}
           REPO:          ${{ github.repository }}
           RC_BRANCH:     ${{ steps.vars.outputs.rc_branch }}
           SOURCE_BRANCH: ${{ inputs.source_branch }}
