@@ -90,23 +90,8 @@ jobs:
     runs-on: ${{ inputs.runner }}
     outputs:
       version: ${{ steps.gradle-props.outputs.version }}
-    # Stamped into every jar/war MANIFEST.MF as Build-Number by the caller's
-    # buildSrc (NrgXnat/xnat buildlogic.java-common-conventions.gradle):
-    #
-    #   def buildNumber = System.getenv().BUILD_NUMBER?.toInteger() ?: 'Manual'
-    #
-    # BUILD_NUMBER is Jenkins'. Actions never sets it, so every image built here
-    # has shipped `Build-Number: Manual`, which XNAT shows in its footer as
-    # "build: Manual" -- e.g. ghcr.io/nrgxnat/xnat:1.10.1, a clean
-    # releases/1.10.1-rc build (CleanTag true, Dirty false), not a hand build.
-    #
-    # Job-level, not step-level: both `gradlew <task>` and `gradlew publish`
-    # re-run the Jar tasks, so a step-scoped value would leave the JFrog and
-    # GHCR artifacts disagreeing.
-    #
-    # MUST be numeric -- that `?.toInteger()` has no try/catch around it, so a
-    # non-numeric value (a SHA, say) throws NumberFormatException and fails the
-    # build. github.run_number is always an integer.
+    # Jenkins' BUILD_NUMBER, which Actions does not set; without it callers'
+    # build.gradle stamps Build-Number: Manual. Must be numeric.
     env:
       BUILD_NUMBER: ${{ github.run_number }}
     steps:
