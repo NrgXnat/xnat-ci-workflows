@@ -13,7 +13,8 @@ name: Reusable - Gradle Release Promote RC to Main
 #   - derives RELEASE_VERSION = RC_VERSION without the -RC-SNAPSHOT suffix
 #   - rewrites build.gradle to RELEASE_VERSION in a local commit only; rc_branch on
 #     origin stays at -RC-SNAPSHOT, so only target_main's build publishes the release
-#   - refuses to release while build.gradle / gradle.properties still name a SNAPSHOT
+#   - refuses to release while any tracked Gradle script, gradle.properties or version
+#     catalog still names a SNAPSHOT version
 #   - merges the finalized RC into target_main with --no-ff; a conflict on the version
 #     line alone is resolved in the RC's favour, any other conflict fails the run
 #   - tags target_main with RELEASE_VERSION (no `v` prefix; matches monorepo convention)
@@ -110,8 +111,14 @@ jobs:
             echo "::error::RC branch version=${RC_VERSION} must end with -RC-SNAPSHOT"
             exit 1
           fi
+          # rc_branch stays at -RC-SNAPSHOT after its release, so promoting it again (e.g. after
+          # a hotfix landed on it) arrives here. Say how to release the hotfix.
           if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_VERSION}" >/dev/null 2>&1; then
-            echo "::error::Tag ${RELEASE_VERSION} already exists on origin"
+            HINT="the next patch version"
+            if [[ "${RELEASE_VERSION}" =~ ^([0-9]+\.[0-9]+)\.([0-9]+)$ ]]; then
+              HINT="\"${BASH_REMATCH[1]}.$((BASH_REMATCH[2] + 1))-RC-SNAPSHOT\""
+            fi
+            echo "::error::${RELEASE_VERSION} is already released (tag exists). To ship a patch from ${RC_BRANCH}, set its build.gradle version to ${HINT} and re-run."
             exit 1
           fi
 
@@ -138,17 +145,23 @@ jobs:
 
           # A release must not depend on a SNAPSHOT (e.g. vXnat = "1.10.1-SNAPSHOT"). The
           # build would publish it anyway, after the tag below is pushed. Stop here instead,
-          # before anything is committed, merged or tagged. Only a version inside quotes counts
-          # ("1.2-SNAPSHOT" or "group:name:1.2-SNAPSHOT"), so code such as
-          # endsWith("-SNAPSHOT") doesn't trip it.
-          FOUND=0
-          if grep -nE "[\"':][0-9][^\"']*-SNAPSHOT[\"']" build.gradle | grep -vE '^[0-9]+:[[:space:]]*//'; then
-            FOUND=1
-          fi
-          if [[ -f gradle.properties ]] && grep -nE '^[^#]*=[[:space:]]*[0-9][^[:space:]]*-SNAPSHOT' gradle.properties; then
-            FOUND=1
-          fi
-          if [[ "${FOUND}" == 1 ]]; then
+          # before anything is committed, merged or tagged. git grep reads every tracked file
+          # of each kind, so subprojects, settings.gradle and buildSrc are covered too.
+          #
+          # Gradle scripts: only a quoted value ending in -SNAPSHOT counts ("1.2-SNAPSHOT",
+          # 'group:name:dev-SNAPSHOT'), so code such as endsWith("-SNAPSHOT") doesn't trip it.
+          # Lines starting with // are skipped, but a hit inside /* */ or after a trailing //
+          # still fails the run, deliberately: there is no override, because skipping the
+          # check is how a SNAPSHOT dependency gets released. Delete the stale comment on
+          # the RC branch and re-run.
+          SCRIPTS="$(git grep -nE "[\"':][^\"':[:space:]]+-SNAPSHOT[\"']" -- '*.gradle' '*.gradle.kts' \
+                     | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
+          # gradle.properties and version catalogs: any -SNAPSHOT value, in key=value,
+          # key: value or key value form. Comment lines (# or !) are skipped.
+          PROPS="$(git grep -nE "[^[:space:]=:\"']-SNAPSHOT" -- '*gradle.properties' '*.versions.toml' \
+                   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*[#!]' || true)"
+          if [[ -n "${SCRIPTS}${PROPS}" ]]; then
+            printf '%s\n' "${SCRIPTS}" "${PROPS}" | grep -v '^$'
             echo "::error::Release ${RELEASE_VERSION} still names a SNAPSHOT version (above). Fix the RC branch and re-run."
             exit 1
           fi
@@ -183,6 +196,10 @@ jobs:
               git diff
               exit 1
             fi
+            # Safe: the retry is the same merge of the same two commits, so exactly the hunks
+            # checked above conflict again, and -X theirs only decides conflicting hunks.
+            # Everything that merged cleanly above merges the same way again.
+            echo "::notice::Only the version line conflicts, as expected after the first release. Taking ${RC_BRANCH}'s version ${RELEASE_VERSION}."
             git merge --abort
             git merge --no-ff -X theirs "${RC_BRANCH}" -m "release: ${RELEASE_VERSION}"
           fi

@@ -109,8 +109,11 @@ later if we need patch-level pinning.
   release. `main` and the tag are pushed atomically. A conflict on the
   version line alone (the previous release's finalize commit) is resolved
   in the RC's favour; any other conflict still fails the run.
-- **Promote** stops before committing if `build.gradle` or
-  `gradle.properties` still names a SNAPSHOT version, such as `vXnat`.
+- **Promote** stops before committing if a tracked Gradle script, a
+  `gradle.properties` or a version catalog still names a SNAPSHOT version,
+  such as `vXnat`. In scripts only quoted values count, and `//` comment
+  lines are skipped. A hit inside `/* */` or a trailing comment still
+  fails the run; there is no override.
 - **Cut RC** pushes the RC branch and the source-branch bump atomically.
 
 ## What's NOT in this repo (lives in the consuming repo)
