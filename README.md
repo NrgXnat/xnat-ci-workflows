@@ -106,9 +106,12 @@ later if we need patch-level pinning.
 
 - **Promote** no longer pushes the finalize commit to the RC branch. The
   RC branch stays at `-RC-SNAPSHOT` and only `main`'s build publishes the
-  release. `main` and the tag are pushed atomically. A conflict on the
-  version line alone (the previous release's finalize commit) is resolved
-  in the RC's favour; any other conflict still fails the run.
+  release. `main` and the tag are pushed atomically. Conflicts are resolved
+  in the RC's favour (`-X theirs`), including the previous release's version
+  line. **Before promoting, check that everything on `main` has been merged
+  into the source branch** (e.g. merge `main` into `dev` after each
+  release). A change that hasn't is silently overwritten wherever the RC
+  changed the same lines.
 - **Promote** stops before committing if a tracked Gradle script, a
   `gradle.properties` or a version catalog still names a SNAPSHOT version,
   such as `vXnat`. In scripts only quoted values count, and `//` comment
