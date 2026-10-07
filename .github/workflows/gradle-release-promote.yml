@@ -11,9 +11,16 @@ name: Reusable - Gradle Release Promote RC to Main
 # Behavior:
 #   - reads RC_VERSION from build.gradle on rc_branch (must end with -RC-SNAPSHOT)
 #   - derives RELEASE_VERSION = RC_VERSION without the -RC-SNAPSHOT suffix
-#   - rewrites rc_branch's build.gradle to RELEASE_VERSION + commits + pushes
-#   - merges rc_branch into target_main with --no-ff
+#   - rewrites build.gradle to RELEASE_VERSION in a local commit only; rc_branch on
+#     origin stays at -RC-SNAPSHOT, so only target_main's build publishes the release
+#   - refuses to release while any tracked Gradle script, gradle.properties or version
+#     catalog still names a SNAPSHOT version
+#   - merges the finalized RC into target_main with --no-ff -X theirs: every conflicting
+#     hunk takes the RC's side, including the previous release's version line. Changes on
+#     target_main that never reached the source branch are overwritten where they conflict;
+#     checking that they reached it is the release manager's job
 #   - tags target_main with RELEASE_VERSION (no `v` prefix; matches monorepo convention)
+#     and pushes target_main + tag atomically, so a rejected push changes nothing
 #   - optionally dispatches build-publish on target_main
 
 on:
@@ -106,8 +113,14 @@ jobs:
             echo "::error::RC branch version=${RC_VERSION} must end with -RC-SNAPSHOT"
             exit 1
           fi
+          # rc_branch stays at -RC-SNAPSHOT after its release, so promoting it again (e.g. after
+          # a hotfix landed on it) arrives here. Say how to release the hotfix.
           if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_VERSION}" >/dev/null 2>&1; then
-            echo "::error::Tag ${RELEASE_VERSION} already exists on origin"
+            HINT="the next patch version"
+            if [[ "${RELEASE_VERSION}" =~ ^([0-9]+\.[0-9]+)\.([0-9]+)$ ]]; then
+              HINT="\"${BASH_REMATCH[1]}.$((BASH_REMATCH[2] + 1))-RC-SNAPSHOT\""
+            fi
+            echo "::error::${RELEASE_VERSION} is already released (tag exists). To ship a patch from ${RC_BRANCH}, set its build.gradle version to ${HINT} and re-run."
             exit 1
           fi
 
@@ -116,9 +129,13 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Finalize RC branch (strip -RC-SNAPSHOT)
+      # Commits locally only. The next step merges this commit into target_main and pushes
+      # that; rc_branch on origin is never updated, so it never holds a release version.
+      # Pushing it here published the release twice (once from rc_branch, once from
+      # target_main; the loser fails with HTTP 403) and left a failed run un-retryable,
+      # because Validate requires rc_branch to still end in -RC-SNAPSHOT.
+      - name: Finalize release version (strip -RC-SNAPSHOT, local commit)
         env:
-          RC_BRANCH:        ${{ inputs.rc_branch }}
           RC_VERSION:       ${{ steps.vars.outputs.rc_version }}
           RELEASE_VERSION:  ${{ steps.vars.outputs.release_version }}
         run: |
@@ -128,8 +145,30 @@ jobs:
           grep -E '^version ' build.gradle
           git add build.gradle
 
+          # A release must not depend on a SNAPSHOT (e.g. vXnat = "1.10.1-SNAPSHOT"). The
+          # build would publish it anyway, after the tag below is pushed. Stop here instead,
+          # before anything is committed, merged or tagged. git grep reads every tracked file
+          # of each kind, so subprojects, settings.gradle and buildSrc are covered too.
+          #
+          # Gradle scripts: only a quoted value ending in -SNAPSHOT counts ("1.2-SNAPSHOT",
+          # 'group:name:dev-SNAPSHOT'), so code such as endsWith("-SNAPSHOT") doesn't trip it.
+          # Lines starting with // are skipped, but a hit inside /* */ or after a trailing //
+          # still fails the run, deliberately: there is no override, because skipping the
+          # check is how a SNAPSHOT dependency gets released. Delete the stale comment on
+          # the RC branch and re-run.
+          SCRIPTS="$(git grep -nE "[\"':][^\"':[:space:]]+-SNAPSHOT[\"']" -- '*.gradle' '*.gradle.kts' \
+                     | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
+          # gradle.properties and version catalogs: any -SNAPSHOT value, in key=value,
+          # key: value or key value form. Comment lines (# or !) are skipped.
+          PROPS="$(git grep -nE "[^[:space:]=:\"']-SNAPSHOT" -- '*gradle.properties' '*.versions.toml' \
+                   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*[#!]' || true)"
+          if [[ -n "${SCRIPTS}${PROPS}" ]]; then
+            printf '%s\n' "${SCRIPTS}" "${PROPS}" | grep -v '^$'
+            echo "::error::Release ${RELEASE_VERSION} still names a SNAPSHOT version (above). Fix the RC branch and re-run."
+            exit 1
+          fi
+
           git commit -m "chore(release): finalize ${RELEASE_VERSION}"
-          git push origin "HEAD:${RC_BRANCH}"
 
       - name: Merge RC into target_main and tag
         env:
@@ -143,13 +182,22 @@ jobs:
           git switch "${TARGET_MAIN}"
           git pull --ff-only origin "${TARGET_MAIN}"
 
-          # --no-ff to create an explicit merge commit on release boundary;
-          # set -e + no -X strategy → fail fast on conflict (release manager intervenes)
-          git merge --no-ff "origin/${RC_BRANCH}" -m "release: ${RELEASE_VERSION}"
+          # Merges the local rc_branch, which holds the finalize commit (actions/checkout
+          # created it with -B). --no-ff gives an explicit merge commit on the release boundary.
+          # target_main holds the previous release's finalize commit, which source branches
+          # never receive, so its version line conflicts with every later RC: take the RC's
+          # side (-X theirs). This applies to every conflicting hunk in every file, not just the
+          # version line. A change on target_main that never reached the source branch (e.g. a
+          # fix made on an earlier RC) is silently overwritten wherever the RC changed the same
+          # lines. Before promoting, the release manager checks that everything on target_main
+          # has been merged into the source branch. A conflict git cannot settle alone, such as
+          # modify/delete, still fails here, before anything is pushed.
+          git merge --no-ff -X theirs "${RC_BRANCH}" -m "release: ${RELEASE_VERSION}"
 
           git tag "${RELEASE_VERSION}"   # no 'v' prefix (matches monorepo tag convention)
-          git push origin "${TARGET_MAIN}"
-          git push origin "refs/tags/${RELEASE_VERSION}"
+          # Atomic: target_main and the tag land together or not at all. A rejected push
+          # (branch protection, a lock) leaves origin as it was, so the run can be re-run.
+          git push --atomic origin "${TARGET_MAIN}" "refs/tags/${RELEASE_VERSION}"
 
       - name: Trigger build/publish on target_main
         # Only needed when pushing as GITHUB_TOKEN, whose pushes GitHub suppresses
@@ -183,7 +231,7 @@ jobs:
             echo ""
             echo "**Tag**: [\`${RELEASE_VERSION}\`](${SERVER_URL}/${REPOSITORY}/releases/tag/${RELEASE_VERSION})"
             echo "**${TARGET_MAIN}**: [HEAD](${SERVER_URL}/${REPOSITORY}/tree/${TARGET_MAIN})"
-            echo "**${RC_BRANCH}**: kept (finalized to release strings; available for future patches)"
+            echo "**${RC_BRANCH}**: unchanged (still -RC-SNAPSHOT; the finalize commit is on ${TARGET_MAIN} only)"
             echo ""
             echo "| file | value |"
             echo "|------|-------|"
