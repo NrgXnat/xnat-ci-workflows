@@ -32,7 +32,7 @@ on:
 
 jobs:
   build-publish:
-    uses: NrgXnat/xnat-ci-workflows/.github/workflows/gradle-build-publish.yml@v1
+    uses: NrgXnat/xnat-ci-workflows/.github/workflows/gradle-build-publish.yml@v2
     with:
       gradle-build-args: '-x test'              # remove once tests are restored
       artifact-glob: 'xnat-web/build/libs/*.war'
@@ -58,7 +58,7 @@ on:
 
 jobs:
   build-publish:
-    uses: NrgXnat/xnat-ci-workflows/.github/workflows/gradle-build-publish.yml@v1
+    uses: NrgXnat/xnat-ci-workflows/.github/workflows/gradle-build-publish.yml@v2
     with:
       artifact-glob: 'build/libs/*.jar'
       publish-jfrog: ${{ github.event_name == 'push' || inputs.publish_jfrog }}
@@ -71,7 +71,7 @@ jobs:
 ```yaml
 jobs:
   build-publish:
-    uses: NrgXnat/xnat-ci-workflows/.github/workflows/gradle-build-publish.yml@v1
+    uses: NrgXnat/xnat-ci-workflows/.github/workflows/gradle-build-publish.yml@v2
     with:
       java-version: '8'
       artifact-glob: 'xnat-web/build/libs/*.war'
@@ -97,9 +97,21 @@ jobs:
 
 ## Tag versions
 
-Pin to a major tag in the caller (`@v1`). Breaking changes to inputs
-will bump to `@v2`. Lightweight `vN.M` tags may be added later if we
-need patch-level pinning.
+Pin to a major tag in the caller (`@v2`). Breaking changes to inputs
+or behavior bump the major tag. Lightweight `vN.M` tags may be added
+later if we need patch-level pinning.
+
+`v2` changes the release workflows only; inputs are unchanged, and
+`gradle-build-publish.yml` is identical to `v1`:
+
+- **Promote** no longer pushes the finalize commit to the RC branch. The
+  RC branch stays at `-RC-SNAPSHOT` and only `main`'s build publishes the
+  release. `main` and the tag are pushed atomically. A conflict on the
+  version line alone (the previous release's finalize commit) is resolved
+  in the RC's favour; any other conflict still fails the run.
+- **Promote** stops before committing if `build.gradle` or
+  `gradle.properties` still names a SNAPSHOT version, such as `vXnat`.
+- **Cut RC** pushes the RC branch and the source-branch bump atomically.
 
 ## What's NOT in this repo (lives in the consuming repo)
 

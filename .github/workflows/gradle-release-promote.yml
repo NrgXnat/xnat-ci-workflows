@@ -11,9 +11,13 @@ name: Reusable - Gradle Release Promote RC to Main
 # Behavior:
 #   - reads RC_VERSION from build.gradle on rc_branch (must end with -RC-SNAPSHOT)
 #   - derives RELEASE_VERSION = RC_VERSION without the -RC-SNAPSHOT suffix
-#   - rewrites rc_branch's build.gradle to RELEASE_VERSION + commits + pushes
-#   - merges rc_branch into target_main with --no-ff
+#   - rewrites build.gradle to RELEASE_VERSION in a local commit only; rc_branch on
+#     origin stays at -RC-SNAPSHOT, so only target_main's build publishes the release
+#   - refuses to release while build.gradle / gradle.properties still name a SNAPSHOT
+#   - merges the finalized RC into target_main with --no-ff; a conflict on the version
+#     line alone is resolved in the RC's favour, any other conflict fails the run
 #   - tags target_main with RELEASE_VERSION (no `v` prefix; matches monorepo convention)
+#     and pushes target_main + tag atomically, so a rejected push changes nothing
 #   - optionally dispatches build-publish on target_main
 
 on:
@@ -116,9 +120,13 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Finalize RC branch (strip -RC-SNAPSHOT)
+      # Commits locally only. The next step merges this commit into target_main and pushes
+      # that; rc_branch on origin is never updated, so it never holds a release version.
+      # Pushing it here published the release twice (once from rc_branch, once from
+      # target_main; the loser fails with HTTP 403) and left a failed run un-retryable,
+      # because Validate requires rc_branch to still end in -RC-SNAPSHOT.
+      - name: Finalize release version (strip -RC-SNAPSHOT, local commit)
         env:
-          RC_BRANCH:        ${{ inputs.rc_branch }}
           RC_VERSION:       ${{ steps.vars.outputs.rc_version }}
           RELEASE_VERSION:  ${{ steps.vars.outputs.release_version }}
         run: |
@@ -128,8 +136,24 @@ jobs:
           grep -E '^version ' build.gradle
           git add build.gradle
 
+          # A release must not depend on a SNAPSHOT (e.g. vXnat = "1.10.1-SNAPSHOT"). The
+          # build would publish it anyway, after the tag below is pushed. Stop here instead,
+          # before anything is committed, merged or tagged. Only a version inside quotes counts
+          # ("1.2-SNAPSHOT" or "group:name:1.2-SNAPSHOT"), so code such as
+          # endsWith("-SNAPSHOT") doesn't trip it.
+          FOUND=0
+          if grep -nE "[\"':][0-9][^\"']*-SNAPSHOT[\"']" build.gradle | grep -vE '^[0-9]+:[[:space:]]*//'; then
+            FOUND=1
+          fi
+          if [[ -f gradle.properties ]] && grep -nE '^[^#]*=[[:space:]]*[0-9][^[:space:]]*-SNAPSHOT' gradle.properties; then
+            FOUND=1
+          fi
+          if [[ "${FOUND}" == 1 ]]; then
+            echo "::error::Release ${RELEASE_VERSION} still names a SNAPSHOT version (above). Fix the RC branch and re-run."
+            exit 1
+          fi
+
           git commit -m "chore(release): finalize ${RELEASE_VERSION}"
-          git push origin "HEAD:${RC_BRANCH}"
 
       - name: Merge RC into target_main and tag
         env:
@@ -143,13 +167,30 @@ jobs:
           git switch "${TARGET_MAIN}"
           git pull --ff-only origin "${TARGET_MAIN}"
 
-          # --no-ff to create an explicit merge commit on release boundary;
-          # set -e + no -X strategy → fail fast on conflict (release manager intervenes)
-          git merge --no-ff "origin/${RC_BRANCH}" -m "release: ${RELEASE_VERSION}"
+          # Merges the local rc_branch, which holds the finalize commit (actions/checkout
+          # created it with -B). --no-ff gives an explicit merge commit on the release boundary.
+          # target_main holds the previous release's finalize commit, which source branches
+          # never receive, so its version line conflicts with every later RC. When that is
+          # the only conflict, redo the merge taking the RC's side (-X theirs). Any other
+          # conflict fails here, before anything is pushed (release manager intervenes):
+          # -X theirs applied blindly would also overwrite a fix that reached target_main
+          # through an earlier RC but never reached the source branch.
+          if ! git -c merge.conflictStyle=merge merge --no-ff "${RC_BRANCH}" -m "release: ${RELEASE_VERSION}"; then
+            CONFLICTS="$(git diff --name-only --diff-filter=U)"
+            OTHER_LINES="$(awk '/^<<<<<<< /{c=1;next} /^>>>>>>> /{c=0;next} c && !/^=======$/ && !/^version "/' build.gradle)"
+            if [[ "${CONFLICTS}" != "build.gradle" || -n "${OTHER_LINES}" ]]; then
+              echo "::error::Merging ${RC_BRANCH} into ${TARGET_MAIN} conflicts beyond the version line. Merge ${TARGET_MAIN} into ${RC_BRANCH} by hand, then re-run."
+              git diff
+              exit 1
+            fi
+            git merge --abort
+            git merge --no-ff -X theirs "${RC_BRANCH}" -m "release: ${RELEASE_VERSION}"
+          fi
 
           git tag "${RELEASE_VERSION}"   # no 'v' prefix (matches monorepo tag convention)
-          git push origin "${TARGET_MAIN}"
-          git push origin "refs/tags/${RELEASE_VERSION}"
+          # Atomic: target_main and the tag land together or not at all. A rejected push
+          # (branch protection, a lock) leaves origin as it was, so the run can be re-run.
+          git push --atomic origin "${TARGET_MAIN}" "refs/tags/${RELEASE_VERSION}"
 
       - name: Trigger build/publish on target_main
         # Only needed when pushing as GITHUB_TOKEN, whose pushes GitHub suppresses
@@ -183,7 +224,7 @@ jobs:
             echo ""
             echo "**Tag**: [\`${RELEASE_VERSION}\`](${SERVER_URL}/${REPOSITORY}/releases/tag/${RELEASE_VERSION})"
             echo "**${TARGET_MAIN}**: [HEAD](${SERVER_URL}/${REPOSITORY}/tree/${TARGET_MAIN})"
-            echo "**${RC_BRANCH}**: kept (finalized to release strings; available for future patches)"
+            echo "**${RC_BRANCH}**: unchanged (still -RC-SNAPSHOT; the finalize commit is on ${TARGET_MAIN} only)"
             echo ""
             echo "| file | value |"
             echo "|------|-------|"

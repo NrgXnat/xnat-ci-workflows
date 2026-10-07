@@ -13,6 +13,8 @@ name: Reusable - Gradle Release Cut RC Branch
 #   - reads CURRENT_VERSION from build.gradle (must end with -SNAPSHOT)
 #   - cuts `releases/<release>-rc` with version "<release>-RC-SNAPSHOT"
 #   - bumps source_branch to <next_dev_version>
+#   - pushes both atomically, so a rejected push (e.g. branch protection on
+#     source_branch) leaves origin unchanged and the run can be re-run
 #   - optionally dispatches build-publish on both new branches
 
 on:
@@ -123,7 +125,8 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Cut RC branch
+      # This step and the next commit locally only; the push step after them sends both.
+      - name: Cut RC branch (local commit)
         env:
           CURRENT_VERSION:  ${{ steps.vars.outputs.current_version }}
           RELEASE_VERSION:  ${{ steps.vars.outputs.release_version }}
@@ -139,9 +142,8 @@ jobs:
           git add build.gradle
 
           git commit -m "chore(release): cut RC for ${RELEASE_VERSION}"
-          git push -u origin "${RC_BRANCH}"
 
-      - name: Bump source_branch to next dev version
+      - name: Bump source_branch to next dev version (local commit)
         env:
           SOURCE_BRANCH:    ${{ inputs.source_branch }}
           CURRENT_VERSION:  ${{ steps.vars.outputs.current_version }}
@@ -157,7 +159,18 @@ jobs:
 
           git add build.gradle
           git commit -m "chore(release): bump ${SOURCE_BRANCH} to ${NEXT_DEV_VERSION} after cutting ${RELEASE_VERSION}-rc"
-          git push origin "${SOURCE_BRANCH}"
+
+      - name: Push RC branch and source_branch
+        env:
+          SOURCE_BRANCH:    ${{ inputs.source_branch }}
+          RC_BRANCH:        ${{ steps.vars.outputs.rc_branch }}
+        run: |
+          set -euo pipefail
+
+          # Atomic: both land or neither does. Pushed one at a time, a rejected
+          # source_branch push would leave the RC branch behind, and a re-run would
+          # then fail Validate because the RC branch already exists.
+          git push --atomic origin "${RC_BRANCH}" "${SOURCE_BRANCH}"
 
       - name: Trigger build/publish on RC branch and source_branch
         # Only needed when pushing as GITHUB_TOKEN, whose pushes GitHub suppresses
