@@ -90,6 +90,10 @@ jobs:
     runs-on: ${{ inputs.runner }}
     outputs:
       version: ${{ steps.gradle-props.outputs.version }}
+    # Jenkins' BUILD_NUMBER, which Actions does not set; without it callers'
+    # build.gradle stamps Build-Number: Manual. Must be numeric.
+    env:
+      BUILD_NUMBER: ${{ github.run_number }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
